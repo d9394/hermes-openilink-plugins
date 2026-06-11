@@ -465,6 +465,24 @@ index 4c30db7db8c3..8cfad6607af8 100644
      })
  
      async def _handle_debug_command(self, event: MessageEvent) -> str:
+@@ -6584,7 +6596,7 @@
+        elif platform == Platform.YUANBAO:
+            from gateway.platforms.yuanbao import YuanbaoAdapter, WEBSOCKETS_AVAILABLE
+            if not WEBSOCKETS_AVAILABLE:
+                logger.warning("Yuanbao: websockets not installed. Run: pip install websockets")
+                return None
+            return YuanbaoAdapter(config)
++            
++        elif platform == Platform.OPENILINK:
++            from gateway.platforms.openilink import OpeniLinkAdapter, check_openilink_requirements
++            if not check_openilink_requirements:
++                logger.warning("OpenIlink: aiohttp not installed. Run: pip install aiohttp")
++                return None
++            return OpeniLinkAdapter(config)
+
+        return None
+
+    def _adapter_enforces_own_access_policy(self, platform: Optional[Platform]) -> bool:
 diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
 index c049c0f96635..906db1299fea 100644
 --- a/hermes_cli/gateway.py
