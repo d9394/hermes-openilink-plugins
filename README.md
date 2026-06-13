@@ -1,6 +1,4 @@
 useage:   
-  ---  python patch.py /path_of_hermes-agent 9038.diff   
- or:   
-  ---  python patch.py . 9038.diff   
-
-这个方案非常不成熟，不建议使用
+  1 Create a plugin directory in `~/.hermes/plugins/` , such as `~/.hermes/plugins/openilink/`   
+  2 place plugin.yaml and adapter.py into `~/.hermes/plugins/openilink/`   
+  3 hermes-gateway restart   
