@@ -16,7 +16,6 @@ except ImportError:
     aiohttp = None
     AIOHTTP_AVAILABLE = False
 
-# 注意：不再从核心导入 Platform 枚举，保持核心代码零侵入 (Zero changes)
 from gateway.config import PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -28,14 +27,43 @@ from gateway.platforms.base import (
 )
 
 # ------------------------------------------------------------------
-# Plugin Hooks (插件专用钩子函数)
+# 修复版的鸭子类型伪装器：支持哈希，解决 unhashable 报错
+# ------------------------------------------------------------------
+class PlatformFakeEnum:
+    """伪装成 Platform 枚举对象，支持哈希和字符串值返回"""
+    def __init__(self, val: str):
+        self._val = val
+
+    @property
+    def value(self) -> str:
+        return self._val
+
+    def __str__(self) -> str:
+        return self._val
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, PlatformFakeEnum):
+            return self._val == other._val
+        return str(other) == self._val
+
+    def __hash__(self) -> int:
+        # 【核心修复】返回字符串的哈希，这样就能完美混入 {} 集合或 dict 的 key 中
+        return hash(self._val)
+
+
+# ------------------------------------------------------------------
+# 内部钩子函数实现 (由 register 传入，桥接系统机制)
 # ------------------------------------------------------------------
 
-def apply_yaml_config(yaml_cfg: dict, platform_cfg: PlatformConfig) -> Optional[dict]:
-    """
-    将用户的 config.yaml 配置项转换为环境变量，或直接注入到 platform_cfg.extra 中。
-    允许插件拥有自己独立的配置架构，而不破坏核心 gateway/config.py。
-    """
+def check_openilink_requirements() -> bool:
+    """检查依赖与关键环境变量是否就绪"""
+    if not AIOHTTP_AVAILABLE:
+        return False
+    return bool(os.getenv("OPENILINK_TOKEN"))
+
+
+def _apply_yaml_config(yaml_cfg: dict, platform_cfg: PlatformConfig) -> Optional[dict]:
+    """接管主 config.yaml 中 openilink 块的解析，并将其动态映射为环境变量"""
     extra_updates = {}
     openilink_cfg = yaml_cfg.get("openilink", {})
     
@@ -46,44 +74,34 @@ def apply_yaml_config(yaml_cfg: dict, platform_cfg: PlatformConfig) -> Optional[
         os.environ["OPENILINK_HUB_URL"] = str(openilink_cfg["hub_url"])
         extra_updates["hub_url"] = openilink_cfg["hub_url"]
         
+    if "allow_all_users" in openilink_cfg and not os.getenv("OPENILINK_ALLOW_ALL_USERS"):
+        os.environ["OPENILINK_ALLOW_ALL_USERS"] = str(openilink_cfg["allow_all_users"]).lower()
+        
     return extra_updates
 
 
-def env_enablement() -> Optional[dict]:
-    """
-    在适配器实例化之前从环境变量中种子化配置。
-    以此确保仅有环境变量的用户设置在执行 `hermes gateway status` 时能正确显示。
-    """
-    token = os.getenv("OPENILINK_TOKEN", "")
-    hub_url = os.getenv("OPENILINK_HUB_URL", "https://localhost:9800")
-    home_channel = os.getenv("OPENILINK_HOME_CHANNEL", "")
-    
-    if not token:
-        return None
-        
-    result = {
-        "extra": {"hub_url": hub_url},
-        "token": token
-    }
-    if home_channel:
-        result["home_channel"] = {"chat_id": home_channel}
-    return result
-
+def _is_connected(adapter: OpeniLinkAdapter) -> bool:
+    """供系统状态监测指令（如 hermes gateway status）检查连接可用性"""
+    return adapter._ws is not None and not adapter._ws.closed
 
 # ------------------------------------------------------------------
-# Adapter Implementation (适配器核心实现)
+# OpeniLink 适配器核心类实现
 # ------------------------------------------------------------------
 
 class OpeniLinkAdapter(BasePlatformAdapter):
-    """通过 WebSocket 连接到 OpeniLink Hub 以收发消息的 Hermes 插件适配器。"""
+    """通过 WebSocket 连接到 OpeniLink Hub 架构的消息适配器插件。"""
 
     _MAX_RECONNECT_ATTEMPTS = 10
     _BASE_DELAY = 2.0
     _MAX_DELAY = 60.0
 
     def __init__(self, config: PlatformConfig):
-        # 传入字符串标识 "openilink" 作为平台名，底层基类会自动将其处理为动态平台
-        super().__init__(config, "openilink")
+        # 1. 传入支持哈希的伪装枚举对象
+        fake_platform = PlatformFakeEnum("openilink")
+        super().__init__(config, fake_platform)  # type: ignore
+
+        # 2. 显式确保我们的实例属性也是这个伪装对象
+        self.platform = fake_platform
 
         hub_url = (config.extra.get("hub_url") or "").rstrip("/")
         if not hub_url:
@@ -98,17 +116,11 @@ class OpeniLinkAdapter(BasePlatformAdapter):
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._receive_task: Optional[asyncio.Task] = None
         self._reconnect_attempts: int = 0
-        self._bot_id: str = ""
-        self._installation_id: str = ""
 
     async def connect(self) -> bool:
-        if not AIOHTTP_AVAILABLE:
-            logger.error("[openilink] Cannot connect: aiohttp is not installed.")
-            return False
         if not self._token:
             logger.error("[openilink] Cannot connect: OPENILINK_TOKEN is missing.")
             return False
-            
         try:
             if self._session is None or self._session.closed:
                 self._session = aiohttp.ClientSession()
@@ -165,17 +177,13 @@ class OpeniLinkAdapter(BasePlatformAdapter):
 
     async def _dispatch(self, payload: dict) -> None:
         msg_type = payload.get("type", "")
-
         if msg_type == "init":
             data = payload.get("data", {})
-            self._bot_id = data.get("bot_id", "")
-            self._installation_id = data.get("installation_id", "")
-            logger.info("[openilink] Init complete: bot=%s, installation=%s", self._bot_id, self._installation_id)
+            logger.info("[openilink] Init: bot=%s, installation=%s", data.get("bot_id", ""), data.get("installation_id", ""))
         elif msg_type == "event":
             await self._handle_event(payload)
-        elif msg_type == "ack":
-            if not payload.get("ok", False):
-                logger.warning("[openilink] ACK failed for req_id=%s", payload.get("req_id", ""))
+        elif msg_type == "ack" and not payload.get("ok", False):
+            logger.warning("[openilink] ACK failed for req_id=%s", payload.get("req_id", ""))
         elif msg_type == "error":
             logger.error("[openilink] Server error message: %s", payload.get("error", ""))
 
@@ -216,7 +224,7 @@ class OpeniLinkAdapter(BasePlatformAdapter):
                         logger.warning("[openilink] Failed to cache media: %s", exc)
 
         text = "\n".join(text_parts)
-
+        
         if event_type == "message.image" or media_urls:
             msg_type = MessageType.PHOTO
         elif event_type == "message.voice":
@@ -228,12 +236,7 @@ class OpeniLinkAdapter(BasePlatformAdapter):
         else:
             msg_type = MessageType.TEXT
 
-        source = self.build_source(
-            chat_id=chat_id,
-            chat_type=chat_type,
-            user_id=user_id,
-        )
-
+        source = self.build_source(chat_id=chat_id, chat_type=chat_type, user_id=user_id)
         event = MessageEvent(
             text=text,
             message_type=msg_type,
@@ -273,12 +276,11 @@ class OpeniLinkAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc), retryable=True)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        if not self._ws or self._ws.closed:
-            return
-        try:
-            await self._ws.send_json({"type": "send_typing", "to": chat_id})
-        except Exception:
-            pass
+        if self._ws and not self._ws.closed:
+            try:
+                await self._ws.send_json({"type": "send_typing", "to": chat_id})
+            except Exception:
+                pass
 
     async def send_image(
         self,
@@ -314,9 +316,30 @@ class OpeniLinkAdapter(BasePlatformAdapter):
 
 
 # ------------------------------------------------------------------
-# Plugin Entry Point (插件向系统注册自己唯一的入口)
+# 模仿 Discord 规范的全新动态平台注册器
 # ------------------------------------------------------------------
 
 def register(ctx: Any) -> None:
-    """让 Hermes 核心识别并加载 OpeniLink 平台网关"""
-    ctx.register_platform("openilink", OpeniLinkAdapter)
+    """Plugin entry point — called by the Hermes plugin system."""
+    ctx.register_platform(
+        name="openilink",
+        label="OpeniLink Hub",
+        adapter_factory=OpeniLinkAdapter,
+        check_fn=check_openilink_requirements,
+        is_connected=_is_connected,
+        required_env=["OPENILINK_TOKEN"],
+        
+        # 绑定 YAML 转换桥梁钩子
+        apply_yaml_config_fn=_apply_yaml_config,
+        
+        # 将全局允许变量绑定到内核的鉴权机制
+        allow_all_env="OPENILINK_ALLOW_ALL_USERS",
+        
+        # Cron 定时投递的专属默认环境变量
+        cron_deliver_env_var="OPENILINK_HOME_CHANNEL",
+        
+        # 基础限制与展示定义
+        max_message_length=4096,
+        emoji="🔗",
+        allow_update_command=True,
+    )
