@@ -7,7 +7,8 @@
       OPENILINK_HUB_URL=https://hub.openilink.com   
       OPENILINK_TOKEN=app_4fad0f7afofoijweofjo;fjel;jfle   
      OPENILINK_ALLOW_ALL_USERS=true   
--  4 hermes gateway restart   
+-  4 hermes gateway restart
+-  5 hermes plugins enable openilink   
    
    
 ## openilink-hub project :
